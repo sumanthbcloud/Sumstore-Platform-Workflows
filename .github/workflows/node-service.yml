@@ -173,11 +173,31 @@ jobs:
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           ECR_IMAGE="${ECR_REGISTRY}/sumstore/${{ inputs.service_name }}:${{ github.sha }}"
 
-          echo "Tagging local image as ${ECR_IMAGE}"
-          docker tag "sumstore/${{ inputs.service_name }}:${{ github.sha }}" "${ECR_IMAGE}"
+          echo "Checking whether image ${ECR_IMAGE} already exists in Amazon ECR..."
+          if ! LOOKUP_OUTPUT=$(aws ecr batch-get-image \
+            --repository-name "sumstore/${{ inputs.service_name }}" \
+            --image-ids imageTag="${{ github.sha }}"); then
+            echo "ERROR: Failed to query Amazon ECR for image tag. Aborting pipeline."
+            exit 1
+          fi
 
-          echo "Pushing ${ECR_IMAGE} to Amazon ECR..."
-          docker push "${ECR_IMAGE}"
+          IMAGE_COUNT=$(echo "$LOOKUP_OUTPUT" | jq -r ".images | length")
+          if [ "$IMAGE_COUNT" -gt 0 ]; then
+            echo "Immutable image ${ECR_IMAGE} already exists in Amazon ECR. Skipping docker push."
+          else
+            FAILURE_CODE=$(echo "$LOOKUP_OUTPUT" | jq -r ".failures[0].failureCode // empty")
+            if [ -n "$FAILURE_CODE" ] && [ "$FAILURE_CODE" != "ImageNotFound" ]; then
+              echo "ERROR: Unexpected ECR lookup failure: $FAILURE_CODE"
+              exit 1
+            fi
+
+            echo "Image ${ECR_IMAGE} does not exist in Amazon ECR."
+            echo "Tagging local image as ${ECR_IMAGE}..."
+            docker tag "sumstore/${{ inputs.service_name }}:${{ github.sha }}" "${ECR_IMAGE}"
+
+            echo "Pushing ${ECR_IMAGE} to Amazon ECR..."
+            docker push "${ECR_IMAGE}"
+          fi
 
       # -----------------------------------------------------------------------
       # 17, 18, 19, 20. Update GitOps Repository
