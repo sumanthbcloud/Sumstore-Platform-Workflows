@@ -23,6 +23,11 @@ on:
         description: "Relative path to service values file in GitOps repository"
         required: true
         type: string
+      trivy_ignore_file:
+        description: "Optional relative path to service-specific Trivy ignore file"
+        required: false
+        type: string
+        default: ""
 
     secrets:
       GITOPS_TOKEN:
@@ -140,6 +145,7 @@ jobs:
           ignore-unfixed: false
           severity: CRITICAL,HIGH
           skip-setup-trivy: true
+          trivyignores: ${{ inputs.trivy_ignore_file }}
 
       # -----------------------------------------------------------------------
       # 12. Authenticate to AWS using GitHub OIDC
