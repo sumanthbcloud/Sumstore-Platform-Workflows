@@ -133,22 +133,21 @@ jobs:
       # -----------------------------------------------------------------------
       # 11. Trivy Vulnerability Scanning
       # -----------------------------------------------------------------------
-      - name: Trivy Vulnerability Scan (Critical - Blocking)
-        uses: aquasecurity/trivy-action@v0.31.0
+      - name: Set Up Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          cache: true
+          version: v0.76.1
+
+      - name: Trivy Vulnerability Scan (Critical & High - Blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: sumstore/${{ inputs.service_name }}:${{ github.sha }}
           format: table
           exit-code: "1"
           ignore-unfixed: false
-          severity: CRITICAL
-
-      - name: Trivy Vulnerability Report (High - Advisory)
-        uses: aquasecurity/trivy-action@v0.31.0
-        with:
-          image-ref: sumstore/${{ inputs.service_name }}:${{ github.sha }}
-          format: table
-          exit-code: "0"
-          severity: HIGH
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
 
       # -----------------------------------------------------------------------
       # 12. Authenticate to AWS using GitHub OIDC
