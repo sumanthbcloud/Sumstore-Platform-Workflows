@@ -1,0 +1,288 @@
+name: Reusable Go Service CI
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Name of the service (e.g. dispatch)"
+        required: true
+        type: string
+      go_version:
+        description: "Go runtime version (e.g. 1.23)"
+        required: true
+        type: string
+      build_context:
+        description: "Docker build context / application directory"
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile"
+        required: true
+        type: string
+      gitops_values_path:
+        description: "Relative path to service values file in GitOps repository"
+        required: true
+        type: string
+      trivy_ignore_file:
+        description: "Optional relative path to service-specific Trivy ignore file"
+        required: false
+        type: string
+        default: ""
+
+    secrets:
+      GITOPS_TOKEN:
+        description: "GitHub Personal Access Token for GitOps repository updates"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pipeline:
+    name: Build, Scan & Deploy ${{ inputs.service_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout Application Repository
+      # -----------------------------------------------------------------------
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # 2. Secret Scanning (Gitleaks)
+      # -----------------------------------------------------------------------
+      - name: Secret Scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 3. Set Up Go Runtime
+      # -----------------------------------------------------------------------
+      - name: Set Up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+          cache-dependency-path: ${{ inputs.build_context }}/go.sum
+
+      # -----------------------------------------------------------------------
+      # 4. Go Application Validation, Tests & Build
+      # -----------------------------------------------------------------------
+      - name: Validate, Test & Build Go Application
+        working-directory: ${{ inputs.build_context }}
+        run: |
+          echo "Running go vet..."
+          go vet ./...
+          echo "Running go test..."
+          go test -v ./...
+          echo "Verifying Go build..."
+          CGO_ENABLED=0 go build -v -o /dev/null .
+
+      # -----------------------------------------------------------------------
+      # 5. SonarQube SAST Static Analysis (Disabled for now)
+      # -----------------------------------------------------------------------
+      # - name: SonarQube Static Analysis
+      #   uses: sonarsource/sonarqube-scan-action@v3
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #     SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+      #   with:
+      #     args: >
+      #       -Dsonar.projectKey=sumstore-${{ inputs.service_name }}
+      #       -Dsonar.sources=${{ inputs.build_context }}
+
+      # -----------------------------------------------------------------------
+      # 6. SonarQube Quality Gate (Disabled for now)
+      # -----------------------------------------------------------------------
+      # - name: SonarQube Quality Gate
+      #   uses: sonarsource/sonarqube-quality-gate-action@v1
+      #   timeout-minutes: 5
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #     SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      # -----------------------------------------------------------------------
+      # 7. Software Composition Analysis (SCA) (Disabled for now)
+      # -----------------------------------------------------------------------
+      # - name: Dependency / SCA Scan
+      #   run: |
+      #     echo "SCA scan disabled for now"
+
+      # -----------------------------------------------------------------------
+      # 8. Set Up Docker Buildx
+      # -----------------------------------------------------------------------
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      # 9 & 10. Build Docker Image (Build once, load locally for scanning)
+      # -----------------------------------------------------------------------
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: sumstore/${{ inputs.service_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -----------------------------------------------------------------------
+      # 11. Trivy Vulnerability Scanning
+      # -----------------------------------------------------------------------
+      - name: Set Up Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          cache: true
+          version: v0.76.1
+
+      - name: Trivy Vulnerability Scan (Critical & High - Blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: sumstore/${{ inputs.service_name }}:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: false
+          severity: CRITICAL,HIGH
+          skip-setup-trivy: true
+          trivyignores: ${{ inputs.trivy_ignore_file }}
+
+      # -----------------------------------------------------------------------
+      # 12. Authenticate to AWS using GitHub OIDC
+      # -----------------------------------------------------------------------
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # 13. Log In to Amazon ECR
+      # -----------------------------------------------------------------------
+      - name: Log In to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------------
+      # 14, 15, 16. Tag and Push Pre-Built Image to Amazon ECR
+      # -----------------------------------------------------------------------
+      - name: Push Image to Amazon ECR
+        run: |
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          ECR_IMAGE="${ECR_REGISTRY}/sumstore/${{ inputs.service_name }}:${{ github.sha }}"
+
+          echo "Checking whether image ${ECR_IMAGE} already exists in Amazon ECR..."
+          if ! LOOKUP_OUTPUT=$(aws ecr batch-get-image \
+            --repository-name "sumstore/${{ inputs.service_name }}" \
+            --image-ids imageTag="${{ github.sha }}"); then
+            echo "ERROR: Failed to query Amazon ECR for image tag. Aborting pipeline."
+            exit 1
+          fi
+
+          IMAGE_COUNT=$(echo "$LOOKUP_OUTPUT" | jq -r ".images | length")
+          if [ "$IMAGE_COUNT" -gt 0 ]; then
+            echo "Immutable image ${ECR_IMAGE} already exists in Amazon ECR. Skipping docker push."
+          else
+            FAILURE_CODE=$(echo "$LOOKUP_OUTPUT" | jq -r ".failures[0].failureCode // empty")
+            if [ -n "$FAILURE_CODE" ] && [ "$FAILURE_CODE" != "ImageNotFound" ]; then
+              echo "ERROR: Unexpected ECR lookup failure: $FAILURE_CODE"
+              exit 1
+            fi
+
+            echo "Image ${ECR_IMAGE} does not exist in Amazon ECR."
+            echo "Tagging local image as ${ECR_IMAGE}..."
+            docker tag "sumstore/${{ inputs.service_name }}:${{ github.sha }}" "${ECR_IMAGE}"
+
+            echo "Pushing ${ECR_IMAGE} to Amazon ECR..."
+            docker push "${ECR_IMAGE}"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 17, 18, 19, 20. Update GitOps Repository
+      # -----------------------------------------------------------------------
+      - name: Update GitOps Deployment
+        run: |
+          if [ -z "${{ secrets.GITOPS_TOKEN }}" ]; then
+            echo "ERROR: GITOPS_TOKEN secret is not configured."
+            exit 1
+          fi
+
+          if [ -z "${{ vars.GITOPS_REPOSITORY }}" ]; then
+            echo "ERROR: GITOPS_REPOSITORY variable is not configured."
+            exit 1
+          fi
+
+          GITOPS_DIR=$(mktemp -d)
+          echo "Cloning GitOps repository ${{ vars.GITOPS_REPOSITORY }}..."
+          git clone \
+            --depth 1 \
+            --branch main \
+            "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/${{ vars.GITOPS_REPOSITORY }}.git" \
+            "$GITOPS_DIR"
+
+          VALUES_FILE="${GITOPS_DIR}/${{ inputs.gitops_values_path }}"
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "ERROR: Values file not found at $VALUES_FILE"
+            exit 1
+          fi
+
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          TARGET_REPO="${ECR_REGISTRY}/sumstore/${{ inputs.service_name }}"
+          TARGET_TAG="${{ github.sha }}"
+
+          echo "Updating image in $VALUES_FILE..."
+          if yq -e ".${{ inputs.service_name }}.image" "$VALUES_FILE" >/dev/null 2>&1; then
+            yq -i ".${{ inputs.service_name }}.image.repository = \"${TARGET_REPO}\" | .${{ inputs.service_name }}.image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
+          else
+            yq -i ".image.repository = \"${TARGET_REPO}\" | .image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
+          fi
+
+          cd "$GITOPS_DIR"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ inputs.gitops_values_path }}"
+
+          if git diff --staged --quiet; then
+            echo "No GitOps changes detected; manifest is already up-to-date."
+          else
+            echo "Committing GitOps change..."
+            git commit -m "chore(deps): update ${{ inputs.service_name }} image to ${TARGET_TAG}"
+            git push origin main
+            echo "GitOps repository updated successfully."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 21. Slack Notifications (Disabled for now)
+      # -----------------------------------------------------------------------
+      # - name: Notify Slack on Success
+      #   if: success()
+      #   run: |
+      #     if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+      #       PAYLOAD=$(cat <<EOF
+      #       {
+      #         "text": "✅ Pipeline succeeded for ${{ inputs.service_name }}:${{ github.sha }}"
+      #       }
+      #       EOF
+      #       )
+      #       curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "${{ secrets.SLACK_WEBHOOK_URL }}"
+      #     fi
+      #
+      # - name: Notify Slack on Failure
+      #   if: failure()
+      #   run: |
+      #     if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+      #       PAYLOAD=$(cat <<EOF
+      #       {
+      #         "text": "❌ Pipeline failed for ${{ inputs.service_name }}:${{ github.sha }}"
+      #       }
+      #       EOF
+      #       )
+      #       curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "${{ secrets.SLACK_WEBHOOK_URL }}"
+      #     fi
