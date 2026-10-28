@@ -228,7 +228,7 @@ jobs:
             "$GITOPS_DIR"
 
           TARGET_VALUES_PATH="${{ inputs.gitops_values_path }}"
-          if [ -z "$TARGET_VALUES_PATH" ] || [ "$TARGET_VALUES_PATH" = "helm/sumstore/values/${{ inputs.service_name }}.yaml" ]; then
+          if [ -z "$TARGET_VALUES_PATH" ]; then
             TARGET_VALUES_PATH="apps/${{ inputs.service_name }}/values.yaml"
           fi
 
