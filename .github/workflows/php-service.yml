@@ -21,7 +21,8 @@ on:
         type: string
       gitops_values_path:
         description: "Relative path to service values file in GitOps repository"
-        required: true
+        required: false
+        default: ""
         type: string
       trivy_ignore_file:
         description: "Optional relative path to service-specific Trivy ignore file"
@@ -213,28 +214,31 @@ jobs:
           echo "Cloning GitOps repository ${{ vars.GITOPS_REPOSITORY }}..."
           git clone             --depth 1             --branch main             "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/${{ vars.GITOPS_REPOSITORY }}.git"             "$GITOPS_DIR"
 
-          VALUES_FILE="${GITOPS_DIR}/${{ inputs.gitops_values_path }}"
+          TARGET_VALUES_PATH="${{ inputs.gitops_values_path }}"
+          if [ -z "$TARGET_VALUES_PATH" ] || [ "$TARGET_VALUES_PATH" = "helm/sumstore/values/${{ inputs.service_name }}.yaml" ]; then
+            TARGET_VALUES_PATH="apps/${{ inputs.service_name }}/values.yaml"
+          fi
+
+          VALUES_FILE="${GITOPS_DIR}/${TARGET_VALUES_PATH}"
           if [ ! -f "$VALUES_FILE" ]; then
             echo "ERROR: Values file not found at $VALUES_FILE"
             exit 1
           fi
 
-          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          TARGET_REPO="${ECR_REGISTRY}/sumstore/${{ inputs.service_name }}"
           TARGET_TAG="${{ github.sha }}"
 
-          echo "Updating image in $VALUES_FILE..."
+          echo "Updating image tag in $VALUES_FILE..."
           if yq -e ".${{ inputs.service_name }}.image" "$VALUES_FILE" >/dev/null 2>&1; then
-            yq -i ".${{ inputs.service_name }}.image.repository = \"${TARGET_REPO}\" | .${{ inputs.service_name }}.image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
+            yq -i ".${{ inputs.service_name }}.image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
           else
-            yq -i ".image.repository = \"${TARGET_REPO}\" | .image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
+            yq -i ".image.tag = \"${TARGET_TAG}\"" "$VALUES_FILE"
           fi
 
           cd "$GITOPS_DIR"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "${{ inputs.gitops_values_path }}"
+          git add "${TARGET_VALUES_PATH}"
 
           if git diff --staged --quiet; then
             echo "No GitOps changes detected; manifest is already up-to-date."
